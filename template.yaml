@@ -1,0 +1,324 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Bethany's Pie Shop order processing - SQS queue, Lambda consumer, DynamoDB orders table,
+  and a Step Functions load generator (Distributed Map) that sends orders every minute.
+
+Parameters:
+  LambdaMemorySize:
+    Type: Number
+    Default: 128
+    MinValue: 128
+    MaxValue: 10240
+    Description: Memory (MB) allocated to the order processing function.
+
+  LambdaTimeoutSeconds:
+    Type: Number
+    Default: 120
+    MinValue: 3
+    MaxValue: 900
+    Description: Timeout (seconds) of the order processing function.
+
+  EventSourceBatchSize:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: Maximum number of SQS messages delivered to the function in one invocation.
+
+  EventSourceMaxConcurrency:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 1000
+    Description: Maximum concurrent function invocations the SQS event source mapping can drive.
+
+  QueueVisibilityTimeoutSeconds:
+    Type: Number
+    Default: 120
+    MinValue: 0
+    MaxValue: 43200
+    Description: SQS visibility timeout (seconds). Keep at least 6x the function timeout.
+
+  LoadGeneratorState:
+    Type: String
+    Default: ENABLED
+    AllowedValues:
+      - ENABLED
+      - DISABLED
+    Description: Turns the every-minute load generator schedule on or off.
+
+  MessagesPerRun:
+    Type: Number
+    Default: 40
+    MinValue: 1
+    MaxValue: 1000
+    Description: Number of order messages the load generator sends each minute.
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Queue and dead-letter queue
+  # ---------------------------------------------------------------------------
+  OrdersDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-orders-dlq"
+      MessageRetentionPeriod: 1209600
+
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-orders"
+      VisibilityTimeout: !Ref QueueVisibilityTimeoutSeconds
+      MessageRetentionPeriod: 345600
+    #   RedrivePolicy:
+    #     deadLetterTargetArn: !GetAtt OrdersDeadLetterQueue.Arn
+    #     maxReceiveCount: 5
+
+  # ---------------------------------------------------------------------------
+  # Downstream store
+  # ---------------------------------------------------------------------------
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-orders"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+
+  # ---------------------------------------------------------------------------
+  # Order processing function
+  # ---------------------------------------------------------------------------
+  OrderProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-order-processor"
+      RetentionInDays: 7
+
+  OrderProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ProcessOrders
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt OrdersQueue.Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt OrdersTable.Arn
+
+  OrderProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-order-processor"
+      Description: Processes Bethany's Pie Shop orders from SQS and stores the result in DynamoDB.
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt OrderProcessorRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeoutSeconds
+      LoggingConfig:
+        LogGroup: !Ref OrderProcessorLogGroup
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrdersTable
+          WORK_ITERATIONS: "1500000"
+      Code:
+        ZipFile: |
+          import hashlib
+          import json
+          import os
+          import time
+
+          import boto3
+
+          table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+          WORK_ITERATIONS = int(os.environ.get("WORK_ITERATIONS", "1500000"))
+
+
+          def process_order(order):
+              # CPU-bound work that stands in for pricing, tax, and fraud checks.
+              # Lambda allocates CPU in proportion to memory, so this scales with MemorySize.
+              digest = order["orderId"].encode()
+              for _ in range(WORK_ITERATIONS):
+                  digest = hashlib.sha256(digest).digest()
+              return digest.hex()
+
+
+          def handler(event, context):
+              failures = []
+              for record in event["Records"]:
+                  try:
+                      order = json.loads(record["body"])
+                      fingerprint = process_order(order)
+                      table.put_item(
+                          Item={
+                              "orderId": order["orderId"],
+                              "customerId": order.get("customerId", "unknown"),
+                              "orderTotal": int(order.get("orderTotal", 0)),
+                              "fingerprint": fingerprint,
+                              "processedAt": int(time.time()),
+                          }
+                      )
+                  except Exception as exc:  # report only the failed message back to SQS
+                      print(f"Failed to process {record['messageId']}: {exc}")
+                      failures.append({"itemIdentifier": record["messageId"]})
+
+              print(json.dumps({
+                  "batchSize": len(event["Records"]),
+                  "memoryMB": context.memory_limit_in_mb,
+                  "failed": len(failures),
+              }))
+              return {"batchItemFailures": failures}
+
+  OrderProcessorEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt OrdersQueue.Arn
+      FunctionName: !Ref OrderProcessorFunction
+      Enabled: true
+      BatchSize: !Ref EventSourceBatchSize
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+    #  ScalingConfig:
+      #  MaximumConcurrency: !Ref EventSourceMaxConcurrency
+
+  # ---------------------------------------------------------------------------
+  # Load generator: EventBridge (every minute) -> Step Functions -> Distributed Map -> SQS
+  # ---------------------------------------------------------------------------
+  LoadGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LoadGenerator
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt OrdersQueue.Arn
+              # The Distributed Map starts child workflow executions of this state machine.
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-load-generator"
+              - Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                  - states:StopExecution
+                Resource: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:${AWS::StackName}-load-generator/*"
+
+  LoadGeneratorStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${AWS::StackName}-load-generator"
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt LoadGeneratorRole.Arn
+      DefinitionSubstitutions:
+        QueueUrl: !Ref OrdersQueue
+        MessagesPerRun: !Ref MessagesPerRun
+      Definition:
+        Comment: Sends a burst of order messages to SQS using a Distributed Map.
+        StartAt: GenerateOrderList
+        States:
+          GenerateOrderList:
+            Type: Pass
+            Parameters:
+              orders.$: "States.ArrayRange(1, ${MessagesPerRun}, 1)"
+            Next: SendOrders
+          SendOrders:
+            Type: Map
+            ItemsPath: $.orders
+            MaxConcurrency: 10
+            ItemSelector:
+              sequence.$: $$.Map.Item.Value
+            ItemProcessor:
+              ProcessorConfig:
+                Mode: DISTRIBUTED
+                ExecutionType: STANDARD
+              StartAt: SendOrderMessage
+              States:
+                SendOrderMessage:
+                  Type: Task
+                  Resource: arn:aws:states:::sqs:sendMessage
+                  Parameters:
+                    QueueUrl: ${QueueUrl}
+                    MessageBody:
+                      orderId.$: States.UUID()
+                      customerId.$: "States.Format('cust-{}', $.sequence)"
+                      orderTotal.$: States.MathRandom(10, 500)
+                  End: true
+            End: true
+
+  LoadGeneratorScheduleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartLoadGenerator
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref LoadGeneratorStateMachine
+
+  LoadGeneratorSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-load-generator-schedule"
+      Description: Starts the order load generator every minute.
+      ScheduleExpression: rate(1 minute)
+      State: !Ref LoadGeneratorState
+      Targets:
+        - Id: LoadGeneratorStateMachine
+          Arn: !Ref LoadGeneratorStateMachine
+          RoleArn: !GetAtt LoadGeneratorScheduleRole.Arn
+          Input: "{}"
+
+Outputs:
+  QueueUrl:
+    Description: URL of the orders queue.
+    Value: !Ref OrdersQueue
+  FunctionName:
+    Description: Name of the order processing function.
+    Value: !Ref OrderProcessorFunction
+  EventSourceMappingId:
+    Description: UUID of the SQS event source mapping.
+    Value: !Ref OrderProcessorEventSourceMapping
+  OrdersTableName:
+    Description: Name of the downstream orders table.
+    Value: !Ref OrdersTable
+  LoadGeneratorStateMachineArn:
+    Description: ARN of the load generator state machine.
+    Value: !Ref LoadGeneratorStateMachine
