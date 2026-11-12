@@ -3,57 +3,6 @@ Description: >-
   Bethany's Pie Shop order processing - SQS queue, Lambda consumer, DynamoDB orders table,
   and a Step Functions load generator (Distributed Map) that sends orders every minute.
 
-Parameters:
-  LambdaMemorySize:
-    Type: Number
-    Default: 128
-    MinValue: 128
-    MaxValue: 10240
-    Description: Memory (MB) allocated to the order processing function.
-
-  LambdaTimeoutSeconds:
-    Type: Number
-    Default: 120
-    MinValue: 3
-    MaxValue: 900
-    Description: Timeout (seconds) of the order processing function.
-
-  EventSourceBatchSize:
-    Type: Number
-    Default: 1
-    MinValue: 1
-    MaxValue: 10
-    Description: Maximum number of SQS messages delivered to the function in one invocation.
-
-  EventSourceMaxConcurrency:
-    Type: Number
-    Default: 2
-    MinValue: 2
-    MaxValue: 1000
-    Description: Maximum concurrent function invocations the SQS event source mapping can drive.
-
-  QueueVisibilityTimeoutSeconds:
-    Type: Number
-    Default: 120
-    MinValue: 0
-    MaxValue: 43200
-    Description: SQS visibility timeout (seconds). Keep at least 6x the function timeout.
-
-  LoadGeneratorState:
-    Type: String
-    Default: ENABLED
-    AllowedValues:
-      - ENABLED
-      - DISABLED
-    Description: Turns the every-minute load generator schedule on or off.
-
-  MessagesPerRun:
-    Type: Number
-    Default: 40
-    MinValue: 1
-    MaxValue: 1000
-    Description: Number of order messages the load generator sends each minute.
-
 Resources:
   # ---------------------------------------------------------------------------
   # Queue and dead-letter queue
@@ -68,7 +17,7 @@ Resources:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: !Sub "${AWS::StackName}-orders"
-      VisibilityTimeout: !Ref QueueVisibilityTimeoutSeconds
+      VisibilityTimeout: 120
       MessageRetentionPeriod: 345600
     #   RedrivePolicy:
     #     deadLetterTargetArn: !GetAtt OrdersDeadLetterQueue.Arn
@@ -133,8 +82,8 @@ Resources:
       Runtime: python3.13
       Handler: index.handler
       Role: !GetAtt OrderProcessorRole.Arn
-      MemorySize: !Ref LambdaMemorySize
-      Timeout: !Ref LambdaTimeoutSeconds
+      MemorySize: 128
+      Timeout: 120
       LoggingConfig:
         LogGroup: !Ref OrderProcessorLogGroup
       Environment:
@@ -195,11 +144,11 @@ Resources:
       EventSourceArn: !GetAtt OrdersQueue.Arn
       FunctionName: !Ref OrderProcessorFunction
       Enabled: true
-      BatchSize: !Ref EventSourceBatchSize
+      BatchSize: 1
       FunctionResponseTypes:
         - ReportBatchItemFailures
-    #  ScalingConfig:
-      #  MaximumConcurrency: !Ref EventSourceMaxConcurrency
+      ScalingConfig:
+         MaximumConcurrency: 2
 
   # ---------------------------------------------------------------------------
   # Load generator: EventBridge (every minute) -> Step Functions -> Distributed Map -> SQS
@@ -240,7 +189,6 @@ Resources:
       RoleArn: !GetAtt LoadGeneratorRole.Arn
       DefinitionSubstitutions:
         QueueUrl: !Ref OrdersQueue
-        MessagesPerRun: !Ref MessagesPerRun
       Definition:
         Comment: Sends a burst of order messages to SQS using a Distributed Map.
         StartAt: GenerateOrderList
@@ -248,7 +196,7 @@ Resources:
           GenerateOrderList:
             Type: Pass
             Parameters:
-              orders.$: "States.ArrayRange(1, ${MessagesPerRun}, 1)"
+              orders.$: "States.ArrayRange(1, 40, 1)"
             Next: SendOrders
           SendOrders:
             Type: Map
@@ -299,7 +247,7 @@ Resources:
       Name: !Sub "${AWS::StackName}-load-generator-schedule"
       Description: Starts the order load generator every minute.
       ScheduleExpression: rate(1 minute)
-      State: !Ref LoadGeneratorState
+      State: ENABLED
       Targets:
         - Id: LoadGeneratorStateMachine
           Arn: !Ref LoadGeneratorStateMachine
