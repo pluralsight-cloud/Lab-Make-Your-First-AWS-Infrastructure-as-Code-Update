@@ -10,13 +10,13 @@ Resources:
   OrdersDeadLetterQueue:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub "${AWS::StackName}-orders-dlq"
+      QueueName: bethany-orders-dlq
       MessageRetentionPeriod: 1209600
 
   OrdersQueue:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub "${AWS::StackName}-orders"
+      QueueName: bethany-orders
       VisibilityTimeout: 120
       MessageRetentionPeriod: 345600
     #   RedrivePolicy:
@@ -29,7 +29,7 @@ Resources:
   OrdersTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: !Sub "${AWS::StackName}-orders"
+      TableName: bethany-orders
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: orderId
@@ -44,7 +44,7 @@ Resources:
   OrderProcessorLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-order-processor"
+      LogGroupName: /aws/lambda/bethany-order-processor
       RetentionInDays: 7
 
   OrderProcessorRole:
@@ -77,7 +77,7 @@ Resources:
   OrderProcessorFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub "${AWS::StackName}-order-processor"
+      FunctionName: bethany-order-processor
       Description: Processes Bethany's Pie Shop orders from SQS and stores the result in DynamoDB.
       Runtime: python3.13
       Handler: index.handler
@@ -148,7 +148,7 @@ Resources:
       FunctionResponseTypes:
         - ReportBatchItemFailures
       ScalingConfig:
-         MaximumConcurrency: 2
+        MaximumConcurrency: 2
 
   # ---------------------------------------------------------------------------
   # Load generator: EventBridge (every minute) -> Step Functions -> Distributed Map -> SQS
@@ -174,17 +174,17 @@ Resources:
               # The Distributed Map starts child workflow executions of this state machine.
               - Effect: Allow
                 Action: states:StartExecution
-                Resource: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-load-generator"
+                Resource: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:bethany-load-generator"
               - Effect: Allow
                 Action:
                   - states:DescribeExecution
                   - states:StopExecution
-                Resource: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:${AWS::StackName}-load-generator/*"
+                Resource: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:bethany-load-generator/*"
 
   LoadGeneratorStateMachine:
     Type: AWS::StepFunctions::StateMachine
     Properties:
-      StateMachineName: !Sub "${AWS::StackName}-load-generator"
+      StateMachineName: bethany-load-generator
       StateMachineType: STANDARD
       RoleArn: !GetAtt LoadGeneratorRole.Arn
       DefinitionSubstitutions:
@@ -244,7 +244,7 @@ Resources:
   LoadGeneratorSchedule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub "${AWS::StackName}-load-generator-schedule"
+      Name: bethany-load-generator-schedule
       Description: Starts the order load generator every minute.
       ScheduleExpression: rate(1 minute)
       State: ENABLED
