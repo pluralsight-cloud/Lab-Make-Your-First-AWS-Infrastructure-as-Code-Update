@@ -19,9 +19,9 @@ Resources:
       QueueName: bethany-orders
       VisibilityTimeout: 120
       MessageRetentionPeriod: 345600
-    #   RedrivePolicy:
-    #     deadLetterTargetArn: !GetAtt OrdersDeadLetterQueue.Arn
-    #     maxReceiveCount: 5
+    #  RedrivePolicy:
+    #    deadLetterTargetArn: !GetAtt OrdersDeadLetterQueue.Arn
+    #    maxReceiveCount: 5
 
   # ---------------------------------------------------------------------------
   # Downstream store
